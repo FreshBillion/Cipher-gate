@@ -311,6 +311,12 @@ def scan_for_signals(cfg):
         print(f"[{now}] {name} no signal: gap {gap:.2f} above {cfg['tolerance']}")
         return True
 
+    close2 = df.loc[c2, "close"]
+    lowest_prev = df["close"].iloc[c2 - RUNUP_WINDOW:c2].min()
+    if close2 < lowest_prev:
+        print(f"[{now}] {name} no signal: candle 2 close {close2:.2f} is the lowest of the last {RUNUP_WINDOW} closes ({lowest_prev:.2f})")
+        return True
+
     entry_price = fetch_current_price(cfg)
     if entry_price is None:
         print(f"[{now}] {name} pattern matched at {ts} but live price fetch failed")
