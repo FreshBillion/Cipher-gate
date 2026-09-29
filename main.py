@@ -16,7 +16,6 @@ TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 
 SYMBOL = "XAU/USD"
 CANDLE_LOOKBACK = 30
-TOP_LOOKBACK = 5
 RUNUP_WINDOW = 12
 
 MONITOR_INTERVAL_SECONDS = 120
@@ -32,6 +31,7 @@ TIMEFRAMES = [
         "minutes": 15,
         "api_key": os.environ["TWELVEDATA_API_KEY_15M"],
         "min_runup": 15,
+        "top_lookback": 8,
         "tolerance": 0.30,
         "sl": 10,
         "tps": [12],            # single TP
@@ -44,6 +44,7 @@ TIMEFRAMES = [
         "minutes": 30,
         "api_key": os.environ["TWELVEDATA_API_KEY_30M"],
         "min_runup": 20,
+        "top_lookback": 6,
         "tolerance": 0.30,
         "sl": 10,
         "tps": [10, 20],        # TP1 then TP2, SL to breakeven after TP1
@@ -296,12 +297,12 @@ def scan_for_signals(cfg):
 
     close1 = df.loc[c1, "close"]
     open2 = df.loc[c2, "open"]
-    prior_high = df["close"].iloc[c1 - TOP_LOOKBACK:c1].max()
+    prior_high = df["close"].iloc[c1 - cfg["top_lookback"]:c1].max()
     runup = close1 - df["close"].iloc[c1 - RUNUP_WINDOW:c1].min()
     gap = abs(close1 - open2)
 
     if close1 <= prior_high:
-        print(f"[{now}] {name} no signal: close1 {close1:.2f} not above prior {TOP_LOOKBACK} ({prior_high:.2f})")
+        print(f"[{now}] {name} no signal: close1 {close1:.2f} not above prior {cfg['top_lookback']} ({prior_high:.2f})")
         return True
     if runup < cfg["min_runup"]:
         print(f"[{now}] {name} no signal: run-up {runup:.2f} below {cfg['min_runup']}")
