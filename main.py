@@ -30,9 +30,9 @@ TIMEFRAMES = [
         "interval": "15min",
         "minutes": 15,
         "api_key": os.environ["TWELVEDATA_API_KEY_15M"],
-        "min_runup": 15,
+        "min_runup": 20,
         "top_lookback": 8,
-        "tolerance": 0.15,
+        "tolerance": 0.10,
         "sl": 10,
         "tps": [12],            # single TP
         "scan_window": 4,       # minutes after candle close in which we scan
@@ -43,9 +43,9 @@ TIMEFRAMES = [
         "interval": "30min",
         "minutes": 30,
         "api_key": os.environ["TWELVEDATA_API_KEY_30M"],
-        "min_runup": 20,
+        "min_runup": 25,
         "top_lookback": 6,
-        "tolerance": 0.20,
+        "tolerance": 0.10,
         "sl": 10,
         "tps": [10, 20],        # TP1 then TP2, SL to breakeven after TP1
         "scan_window": 5,
