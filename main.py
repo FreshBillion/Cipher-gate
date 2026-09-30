@@ -9,7 +9,8 @@ import time
 import requests
 import pandas as pd
 from datetime import datetime, timedelta, timezone
-
+import threading
+import gold_exchange_bot
 # ---------------- CONFIG ----------------
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
@@ -359,9 +360,6 @@ def monitor_open_trades(cfg):
 
     for trade in trades:
         single_tp = trade["tp2"] is None
-        print(f"[{datetime.now(timezone.utc)}] {name} #{trade['id']}: price {price:.2f} | "
-              f"entry {trade['entry']:.2f} | sl {trade['sl']:.2f} | tp1 {trade['tp1']:.2f} | "
-              f"tp1_hit {bool(trade['tp1_hit'])}")
 
         hit_sl = price >= trade["sl"]
 
@@ -448,6 +446,8 @@ def main():
 
     last_scan_key = {cfg["name"]: None for cfg in TIMEFRAMES}
     last_summary_check = 0
+
+    threading.Thread(target=gold_exchange_bot.main, daemon=True).start()
 
     while True:
         now_dt = datetime.now(timezone.utc)
