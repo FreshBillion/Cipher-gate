@@ -44,7 +44,7 @@ TIMEFRAMES = [
         "interval": "30min",
         "minutes": 30,
         "api_key": os.environ["TWELVEDATA_API_KEY_30M"],
-        "min_runup": 25,
+        "min_runup": 30,
         "top_lookback": 12,
         "tolerance": 0.10,
         "sl": 10,
