@@ -20,13 +20,13 @@ SUMMARY_CHECK_INTERVAL_SECONDS = 3600
 
 TIMEFRAMES = [
     {"name": "15M", "label": "15M SCALPING", "tf": "15m", "minutes": 15,
-     "min_runup": 20, "top_lookback": 8, "tolerance": 0.10,
+     "min_runup": 20, "top_lookback": 12, "tolerance": 0.10,
      "sl": 10, "tps": [12], "scan_window": 4, "max_age": 5},
     {"name": "30M", "label": "30M SCALPING", "tf": "30m", "minutes": 30,
-     "min_runup": 30, "top_lookback": 6, "tolerance": 0.20,
+     "min_runup": 30, "top_lookback": 12, "tolerance": 0.20,
      "sl": 10, "tps": [10, 20], "scan_window": 5, "max_age": 10},
     {"name": "1H", "label": "1H", "tf": "1h", "minutes": 60,
-     "min_runup": 40, "top_lookback": 5, "tolerance": 0.30,
+     "min_runup": 40, "top_lookback": 12, "tolerance": 0.30,
      "sl": 10, "tps": [15, 20], "scan_window": 5, "max_age": 10},
 ]
 TF_BY_NAME = {t["name"]: t for t in TIMEFRAMES}
