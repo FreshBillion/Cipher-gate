@@ -424,7 +424,7 @@ def main():
         log("No data source reachable, retrying in 60s")
         time.sleep(60)
 
-    send_telegram(f"✅ Gold CFD bot started (1H + 30M + 15M)\nData source: Bitget CFD {SYMBOL}")
+    send_telegram(f"✅ Gold bot started (1H + 30M + 15M)\nData source: Bitget CFD {SYMBOL}")
     log("CFD bot running: scanning 15M, 30M, 1H")
 
     last_scan = {t["name"]: None for t in TIMEFRAMES}
