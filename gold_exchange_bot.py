@@ -1,17 +1,25 @@
-# ---- Gold Exchange-Data Bot: 1H + 30M + 15M ----
-# Data: Bitget gold perpetual via ccxt, falls back to Kraken if Bitget is unreachable.
+# ---- Gold CFD Bot (Bitget CFD data): 1H + 30M + 15M ----
 # Env vars:
-#   TELEGRAM_CHAT_ID_EXCHANGE     (required, the NEW channel)
+#   BITGET_API_KEY, BITGET_API_SECRET, BITGET_API_PASSPHRASE   (READ-ONLY key)
+#   CFD_SYMBOL                    (optional: XAUUSD, XAUUSD.s or XAUUSD.pro)
+#   TELEGRAM_CHAT_ID_EXCHANGE     (required, the test channel)
 #   TELEGRAM_BOT_TOKEN_EXCHANGE   (optional, defaults to TELEGRAM_BOT_TOKEN)
-#   DB_PATH_EXCHANGE              (optional, e.g. /data/gold_exchange.db)
-# requirements.txt: requests, pandas, ccxt
+#   DB_PATH_EXCHANGE              (optional)
+# requirements.txt: requests (and pandas if main.py still uses it)
 
 import os
 import time
+import hmac
+import hashlib
+import base64
 import sqlite3
 import requests
-import ccxt
+from urllib.parse import urlencode
 from datetime import datetime, timedelta, timezone
+
+BASE_URL = "https://api.bitget.com"
+SYMBOL_CANDIDATES = ["XAUUSD", "XAUUSD.s", "XAUUSD.pro"]
+CANDLE_SIDE = "sell"          # bid-based candles, because signals are sells
 
 CANDLE_LOOKBACK = 30
 RUNUP_WINDOW = 12
@@ -20,25 +28,21 @@ SUMMARY_CHECK_INTERVAL_SECONDS = 3600
 
 TIMEFRAMES = [
     {"name": "15M", "label": "15M SCALPING", "tf": "15m", "minutes": 15,
-     "min_runup": 20, "top_lookback": 12, "tolerance": 0.10,
+     "min_runup": 20, "top_lookback": 8, "tolerance": 0.10,
      "sl": 10, "tps": [12], "scan_window": 4, "max_age": 5},
-    {"name": "30M", "label": "30M SCALPING", "tf": "30m", "minutes": 30,
-     "min_runup": 30, "top_lookback": 12, "tolerance": 0.20,
+    {"name": "30M", "label": "30M SCALPING", "tf": "15m", "minutes": 30,
+     "min_runup": 30, "top_lookback": 6, "tolerance": 0.20,
      "sl": 10, "tps": [10, 20], "scan_window": 5, "max_age": 10},
     {"name": "1H", "label": "1H", "tf": "1h", "minutes": 60,
-     "min_runup": 40, "top_lookback": 12, "tolerance": 0.30,
+     "min_runup": 40, "top_lookback": 5, "tolerance": 0.30,
      "sl": 10, "tps": [15, 20], "scan_window": 5, "max_age": 10},
 ]
 TF_BY_NAME = {t["name"]: t for t in TIMEFRAMES}
 
-# (name, ccxt class, options, candidate symbols in order of preference)
-SOURCES = [
-    ("bitget", ccxt.bitget, {"options": {"defaultType": "swap"}}, ["XAU/USDT:USDT"]),
-    ("kraken", ccxt.kraken, {}, ["XAU/USD", "PAXG/USD"]),
-]
-
 TOKEN = CHAT = DB_PATH = None
-EXCHANGE = SYMBOL = SOURCE = None
+API_KEY = API_SECRET = API_PASS = None
+SYMBOL = None
+COMMANDS_ENABLED = False
 
 
 def log(msg):
@@ -124,38 +128,126 @@ def send_telegram(message):
         log(f"[Telegram error] {e}")
 
 
-# ---------------- DATA SOURCE ----------------
-def pick_source():
-    global EXCHANGE, SYMBOL, SOURCE
-    for name, cls, opts, candidates in SOURCES:
+def check_commands():
+    """/close <id> in the channel. Only active when a separate Telegram bot token is set."""
+    if not COMMANDS_ENABLED:
+        return
+    offset = get_meta("telegram_update_offset")
+    params = {"timeout": 0}
+    if offset:
+        params["offset"] = int(offset)
+    try:
+        r = requests.get(f"https://api.telegram.org/bot{TOKEN}/getUpdates", params=params, timeout=10)
+        updates = r.json().get("result", [])
+    except Exception as e:
+        log(f"[Telegram poll error] {e}")
+        return
+
+    for u in updates:
+        set_meta("telegram_update_offset", str(u["update_id"] + 1))
+        post = u.get("channel_post") or u.get("message")
+        if not post or "text" not in post:
+            continue
+        if str(CHAT).lstrip("-").isdigit() and str(post["chat"]["id"]) != str(CHAT):
+            continue
+        parts = post["text"].strip().split()
+        if not parts or parts[0].split("@")[0] != "/close":
+            continue
         try:
-            ex = cls(dict(opts, enableRateLimit=True, timeout=15000))
-            markets = ex.load_markets()
-            symbol = next((s for s in candidates if s in markets), None)
-            if symbol is None:
-                found = [s for s in markets if "XAU" in s or "PAXG" in s][:15]
-                log(f"[SOURCE] {name}: {candidates} not found. Gold-like symbols available: {found}")
-                continue
-            ex.fetch_ohlcv(symbol, timeframe="15m", limit=5)
-            EXCHANGE, SYMBOL, SOURCE = ex, symbol, name
-            log(f"[SOURCE] Using {name} {symbol}")
-            return True
-        except Exception as e:
-            log(f"[SOURCE] {name} failed: {type(e).__name__}: {str(e)[:200]}")
-    return False
+            tid = int(parts[1])
+        except (IndexError, ValueError):
+            send_telegram("Usage: /close 12 (use the trade number)")
+            continue
+        if not db("SELECT id FROM trades WHERE id=? AND status='open'", (tid,), fetch=True):
+            send_telegram(f"Trade #{tid} not found or already closed.")
+            continue
+        close_trade(tid, "MANUAL_CLOSE")
+        send_telegram(f"⚪ Trade #{tid} manually closed.")
+
+
+# ---------------- BITGET CFD DATA ----------------
+def api_get(path, params):
+    query = urlencode(params)
+    request_path = f"{path}?{query}"
+    ts = str(int(time.time() * 1000))
+    msg = ts + "GET" + request_path
+    sign = base64.b64encode(
+        hmac.new(API_SECRET.encode(), msg.encode(), hashlib.sha256).digest()
+    ).decode()
+    headers = {
+        "ACCESS-KEY": API_KEY, "ACCESS-SIGN": sign, "ACCESS-TIMESTAMP": ts,
+        "ACCESS-PASSPHRASE": API_PASS, "Content-Type": "application/json", "locale": "en-US",
+    }
+    r = requests.get(BASE_URL + request_path, headers=headers, timeout=15)
+    try:
+        j = r.json()
+    except ValueError:
+        raise RuntimeError(f"HTTP {r.status_code}: {r.text[:150]}")
+    if j.get("code") != "00000":
+        raise RuntimeError(f"Bitget {j.get('code')}: {j.get('msg')}")
+    return j["data"]
+
+
+def fetch_quote(symbol=None):
+    """Returns (bid, ask)."""
+    data = api_get("/api/v3/cfd/market/tickers", {"symbol": symbol or SYMBOL})
+    d = data[0] if isinstance(data, list) else data
+    return float(d["bid1"]), float(d["ask1"])
+
+
+def raw_candles(interval, minutes, count):
+    now_ms = int(time.time() * 1000)
+    params = {
+        "symbol": SYMBOL, "interval": interval, "side": CANDLE_SIDE,
+        "startTime": str(now_ms - (count + 2) * minutes * 60000), "limit": "100",
+    }
+    data = api_get("/api/v3/cfd/market/history-candlestick", params)
+    rows = [[int(r[0])] + [float(x) for x in r[1:5]] for r in data]   # [ts, o, h, l, c]
+    return sorted(rows, key=lambda r: r[0])
 
 
 def fetch_candles(tf):
-    limit = CANDLE_LOOKBACK + 2 if SOURCE == "bitget" else None
-    raw = EXCHANGE.fetch_ohlcv(SYMBOL, timeframe=tf["tf"], limit=limit)
     now_ms = time.time() * 1000
     tf_ms = tf["minutes"] * 60000
-    closed = [c for c in raw if c[0] + tf_ms <= now_ms]   # drop the still-forming candle
+    if tf["name"] == "30M":                      # built from two 15M candles
+        rows = raw_candles("15m", 15, 90)
+        by_ts = {r[0]: r for r in rows}
+        out = []
+        for ts in sorted(by_ts):
+            if ts % 1800000 == 0 and ts + 900000 in by_ts:
+                a, b = by_ts[ts], by_ts[ts + 900000]
+                out.append([ts, a[1], max(a[2], b[2]), min(a[3], b[3]), b[4]])
+    else:
+        out = raw_candles(tf["tf"], tf["minutes"], CANDLE_LOOKBACK)
+    closed = [c for c in out if c[0] + tf_ms <= now_ms]      # drop the still-forming candle
     return closed[-CANDLE_LOOKBACK:]
 
 
-def fetch_price():
-    return float(EXCHANGE.fetch_ticker(SYMBOL)["last"])
+def pick_source():
+    global SYMBOL
+    working = []
+    for sym in SYMBOL_CANDIDATES:
+        try:
+            bid, ask = fetch_quote(sym)
+            log(f"[SOURCE] {sym}: bid {bid:.2f} ask {ask:.2f} spread {ask - bid:.2f}")
+            working.append(sym)
+        except Exception as e:
+            log(f"[SOURCE] {sym} failed: {type(e).__name__}: {str(e)[:150]}")
+
+    SYMBOL = os.environ.get("CFD_SYMBOL") or (working[0] if working else None)
+    if SYMBOL is None:
+        return False
+    try:
+        c = fetch_candles(TF_BY_NAME["15M"])
+        if not c:
+            log(f"[SOURCE] {SYMBOL}: no candles returned")
+            return False
+        when = datetime.fromtimestamp(c[-1][0] / 1000, timezone.utc).strftime("%m-%d %H:%M")
+        log(f"[SOURCE] Using {SYMBOL}. Latest closed 15M candle {when} UTC, close {c[-1][4]:.2f}")
+        return True
+    except Exception as e:
+        log(f"[SOURCE] candle test failed for {SYMBOL}: {type(e).__name__}: {str(e)[:150]}")
+        return False
 
 
 # ---------------- STRATEGY (sell-only) ----------------
@@ -175,11 +267,12 @@ def scan(tf):
         log(f"{name} scan skipped: only {len(candles)} candles returned")
         return False
 
+    tf_ms = tf["minutes"] * 60000
     closes = [c[4] for c in candles]
     c1, c2 = len(candles) - 2, len(candles) - 1
     ts = candles[c2][0]
     when = datetime.fromtimestamp(ts / 1000, timezone.utc).strftime("%m-%d %H:%M")
-    age = (time.time() * 1000 - (ts + tf["minutes"] * 60000)) / 60000
+    age = (time.time() * 1000 - (ts + tf_ms)) / 60000
     tag = f"{name} [{when}]"
 
     if age > tf["max_age"]:
@@ -188,6 +281,9 @@ def scan(tf):
     key = f"{name}-{ts}"
     if signaled(key):
         log(f"{tag} skipped: already signaled")
+        return True
+    if candles[c2][0] - candles[c1][0] != tf_ms:
+        log(f"{tag} skipped: candles 1 and 2 are not consecutive (market break)")
         return True
 
     close1, open2, close2 = candles[c1][4], candles[c2][1], candles[c2][4]
@@ -210,13 +306,13 @@ def scan(tf):
         return True
 
     try:
-        entry = fetch_price()
+        entry, _ask = fetch_quote()          # a sell enters at the bid
     except Exception as e:
-        log(f"{tag} pattern matched but price fetch failed: {e}")
+        log(f"{tag} pattern matched but quote fetch failed: {e}")
         return False
     open_new_trade(tf, entry, ts)
     log_signal(key)
-    log(f"{tag} SIGNAL FIRED @ {entry:.2f}")
+    log(f"{tag} SIGNAL FIRED @ {entry:.2f} (gap {gap:.2f})")
     return True
 
 
@@ -240,9 +336,9 @@ def monitor():
     if not trades:
         return
     try:
-        price = fetch_price()
+        _bid, price = fetch_quote()          # a sell closes at the ask
     except Exception as e:
-        log(f"monitor price fetch failed: {type(e).__name__}: {str(e)[:150]}")
+        log(f"monitor quote fetch failed: {type(e).__name__}: {str(e)[:150]}")
         return
 
     for t in trades:
@@ -301,17 +397,23 @@ def weekly_summary():
 
 # ---------------- MAIN LOOP ----------------
 def main():
-    global TOKEN, CHAT, DB_PATH
+    global TOKEN, CHAT, DB_PATH, COMMANDS_ENABLED, API_KEY, API_SECRET, API_PASS
     TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN_EXCHANGE") or os.environ["TELEGRAM_BOT_TOKEN"]
     CHAT = os.environ["TELEGRAM_CHAT_ID_EXCHANGE"]
     DB_PATH = os.environ.get("DB_PATH_EXCHANGE", "gold_exchange.db")
+    API_KEY = os.environ["BITGET_API_KEY"]
+    API_SECRET = os.environ["BITGET_API_SECRET"]
+    API_PASS = os.environ["BITGET_API_PASSPHRASE"]
+    COMMANDS_ENABLED = bool(os.environ.get("TELEGRAM_BOT_TOKEN_EXCHANGE")) and \
+        os.environ.get("TELEGRAM_BOT_TOKEN_EXCHANGE") != os.environ.get("TELEGRAM_BOT_TOKEN")
     init_db()
+
     while not pick_source():
         log("No data source reachable, retrying in 60s")
         time.sleep(60)
 
-    send_telegram(f"✅ Gold exchange-data bot started (1H + 30M + 15M)\nData source: {SOURCE} {SYMBOL}")
-    log("Exchange bot running: scanning 15M, 30M, 1H")
+    send_telegram(f"✅ Gold CFD bot started (1H + 30M + 15M)\nData source: Bitget CFD {SYMBOL}")
+    log("CFD bot running: scanning 15M, 30M, 1H")
 
     last_scan = {t["name"]: None for t in TIMEFRAMES}
     last_summary = 0
@@ -326,6 +428,7 @@ def main():
                     if scan(tf):
                         last_scan[tf["name"]] = boundary
             monitor()
+            check_commands()
             if time.time() - last_summary >= SUMMARY_CHECK_INTERVAL_SECONDS:
                 weekly_summary()
                 last_summary = time.time()
