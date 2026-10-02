@@ -41,6 +41,7 @@ TF_BY_NAME = {t["name"]: t for t in TIMEFRAMES}
 
 TOKEN = CHAT = DB_PATH = None
 API_KEY = API_SECRET = API_PASS = None
+LAST_30M_MODE = None
 SYMBOL = None
 COMMANDS_ENABLED = False
 
@@ -205,23 +206,34 @@ def raw_candles(interval, minutes, count):
     rows = [[int(r[0])] + [float(x) for x in r[1:5]] for r in data]   # [ts, o, h, l, c]
     return sorted(rows, key=lambda r: r[0])
 
-
 def fetch_candles(tf):
+    global LAST_30M_MODE
     now_ms = time.time() * 1000
     tf_ms = tf["minutes"] * 60000
-    if tf["name"] == "30M":                      # built from two 15M candles
-        rows = raw_candles("15m", 15, 90)
-        by_ts = {r[0]: r for r in rows}
+
+    if tf["name"] == "30M":
         out = []
-        for ts in sorted(by_ts):
-            if ts % 1800000 == 0 and ts + 900000 in by_ts:
-                a, b = by_ts[ts], by_ts[ts + 900000]
-                out.append([ts, a[1], max(a[2], b[2]), min(a[3], b[3]), b[4]])
+        try:
+            out = raw_candles("30m", 30, CANDLE_LOOKBACK)      # try native 30m first
+            mode = "native 30m"
+        except Exception:
+            out = []
+        if not out:                                            # fall back: build from 15M
+            mode = "built from 15m"
+            rows = raw_candles("15m", 15, 90)
+            by_ts = {r[0]: r for r in rows}
+            for ts in sorted(by_ts):
+                if ts % 1800000 == 0 and ts + 900000 in by_ts:
+                    a, b = by_ts[ts], by_ts[ts + 900000]
+                    out.append([ts, a[1], max(a[2], b[2]), min(a[3], b[3]), b[4]])
+        if mode != LAST_30M_MODE:
+            log(f"[SOURCE] 30M candles: {mode}")
+            LAST_30M_MODE = mode
     else:
         out = raw_candles(tf["tf"], tf["minutes"], CANDLE_LOOKBACK)
+
     closed = [c for c in out if c[0] + tf_ms <= now_ms]      # drop the still-forming candle
     return closed[-CANDLE_LOOKBACK:]
-
 
 def pick_source():
     global SYMBOL
