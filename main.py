@@ -29,7 +29,7 @@ SUMMARY_CHECK_INTERVAL_SECONDS = 3600
 TIMEFRAMES = [
     {"name": "15M", "label": "15M SCALPING", "tf": "15m", "minutes": 15,
      "min_runup": 15, "top_lookback": 8, "tolerance": 0.30, "min_close_back": 0.30,
-     "sl": 10, "tps": [12], "scan_window": 4, "max_age": 5},
+     "sl": 10, "tps": [10], "scan_window": 4, "max_age": 5},
     {"name": "30M", "label": "30M SCALPING", "tf": "30m", "minutes": 30,
      "min_runup": 20, "top_lookback": 6, "tolerance": 0.30, "min_close_back": 0.30,
      "sl": 10, "tps": [10, 20], "scan_window": 5, "max_age": 10},
