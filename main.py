@@ -1,4 +1,4 @@
-# ---- Gold CFD Bot (Bitget CFD data): 1H + 30M + 15M ----
+# ---- Gold CFD Bot, SELL-ONLY (Bitget CFD data): 1H + 30M + 15M ----
 # Env vars:
 #   BITGET_API_KEY, BITGET_API_SECRET, BITGET_API_PASSPHRASE   (READ-ONLY key)
 #   CFD_SYMBOL                    (optional: XAUUSD, XAUUSD.s or XAUUSD.pro)
@@ -23,13 +23,14 @@ CANDLE_SIDE = "sell"          # bid-based candles, because signals are sells
 
 CANDLE_LOOKBACK = 30
 RUNUP_WINDOW = 12
-MONITOR_INTERVAL_SECONDS = 1
+MONITOR_INTERVAL_SECONDS = 20
 SUMMARY_CHECK_INTERVAL_SECONDS = 3600
+DIVIDER = "━━━━━━━━━━━━"
 
 TIMEFRAMES = [
     {"name": "15M", "label": "15M SCALPING", "tf": "15m", "minutes": 15,
      "min_runup": 15, "top_lookback": 8, "tolerance": 0.30, "min_close_back": 0.30,
-     "sl": 10, "tps": [10], "scan_window": 4, "max_age": 5},
+     "sl": 10, "tps": [12], "scan_window": 4, "max_age": 5},
     {"name": "30M", "label": "30M SCALPING", "tf": "30m", "minutes": 30,
      "min_runup": 20, "top_lookback": 6, "tolerance": 0.30, "min_close_back": 0.30,
      "sl": 10, "tps": [10, 20], "scan_window": 5, "max_age": 10},
@@ -68,7 +69,12 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             timeframe TEXT, entry REAL, sl REAL, tp1 REAL, tp2 REAL,
             tp1_hit INTEGER DEFAULT 0, status TEXT DEFAULT 'open',
-            outcome TEXT, signal_time TEXT, opened_at TEXT, closed_at TEXT)""")
+            outcome TEXT, signal_time TEXT, opened_at TEXT, closed_at TEXT,
+            msg_id INTEGER)""")
+    try:
+        db("ALTER TABLE trades ADD COLUMN msg_id INTEGER")    # upgrade an older database
+    except sqlite3.OperationalError:
+        pass                                                   # column already exists
     db("CREATE TABLE IF NOT EXISTS signal_log (signal_key TEXT PRIMARY KEY)")
     db("CREATE TABLE IF NOT EXISTS bot_meta (key TEXT PRIMARY KEY, value TEXT)")
 
@@ -96,6 +102,10 @@ def insert_trade(tf, entry, sl, tp1, tp2, signal_time):
               (tf, entry, sl, tp1, tp2, str(signal_time), datetime.now(timezone.utc).isoformat()))
 
 
+def set_msg_id(trade_id, msg_id):
+    db("UPDATE trades SET msg_id=? WHERE id=?", (msg_id, trade_id))
+
+
 def open_trades(tf=None):
     if tf:
         return db("SELECT * FROM trades WHERE status='open' AND timeframe=?", (tf,), fetch=True)
@@ -120,13 +130,32 @@ def stats(since, tf):
 
 
 # ---------------- TELEGRAM ----------------
-def send_telegram(message):
+def send_telegram(message, reply_to=None):
+    """Sends a message. Returns the Telegram message id (or None)."""
     url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
     payload = {"chat_id": CHAT, "text": message, "parse_mode": "Markdown"}
+    if reply_to:
+        payload["reply_to_message_id"] = reply_to
+        payload["allow_sending_without_reply"] = True
     try:
-        requests.post(url, data=payload, timeout=10)
+        r = requests.post(url, data=payload, timeout=10)
+        return (r.json().get("result") or {}).get("message_id")
     except Exception as e:
         log(f"[Telegram error] {e}")
+        return None
+
+
+def money(x):
+    return f"{'+' if x >= 0 else '-'}${abs(x):.2f}"
+
+
+def tag(t):
+    """e.g. GOLD 30M · SELL · #12"""
+    return f"📊 *GOLD {t['timeframe']}* · SELL · #{t['id']}"
+
+
+def result_line(t, price):
+    return f"Entry `{t['entry']:.2f}` → Exit `{price:.2f}`\nResult: *{money(t['entry'] - price)}*"
 
 
 def check_commands():
@@ -159,11 +188,12 @@ def check_commands():
         except (IndexError, ValueError):
             send_telegram("Usage: /close 12 (use the trade number)")
             continue
-        if not db("SELECT id FROM trades WHERE id=? AND status='open'", (tid,), fetch=True):
+        rows = db("SELECT * FROM trades WHERE id=? AND status='open'", (tid,), fetch=True)
+        if not rows:
             send_telegram(f"Trade #{tid} not found or already closed.")
             continue
         close_trade(tid, "MANUAL_CLOSE")
-        send_telegram(f"⚪ Trade #{tid} manually closed.")
+        send_telegram(f"⚪ *MANUALLY CLOSED*\n{tag(rows[0])}", reply_to=rows[0].get("msg_id"))
 
 
 # ---------------- BITGET CFD DATA ----------------
@@ -304,17 +334,17 @@ def scan(tf):
     ts = candles[c2][0]
     when = datetime.fromtimestamp(ts / 1000, timezone.utc).strftime("%m-%d %H:%M")
     age = (time.time() * 1000 - (ts + tf_ms)) / 60000
-    tag = f"{name} [{when}]"
+    tag_ = f"{name} [{when}]"
 
     if age > tf["max_age"]:
-        log(f"{tag} skipped: candle closed {age:.0f} min ago, too old")
+        log(f"{tag_} skipped: candle closed {age:.0f} min ago, too old")
         return True
     key = f"{name}-{ts}"
     if signaled(key):
-        log(f"{tag} skipped: already signaled")
+        log(f"{tag_} skipped: already signaled")
         return True
     if candles[c2][0] - candles[c1][0] != tf_ms:
-        log(f"{tag} skipped: candles 1 and 2 are not consecutive (market break)")
+        log(f"{tag_} skipped: candles 1 and 2 are not consecutive (market break)")
         return True
 
     close1, open2, close2 = candles[c1][4], candles[c2][1], candles[c2][4]
@@ -324,31 +354,31 @@ def scan(tf):
     lowest_prev = min(closes[c2 - RUNUP_WINDOW:c2])
 
     if close1 <= prior_high:
-        log(f"{tag} no signal: close1 {close1:.2f} not above prior {tf['top_lookback']} ({prior_high:.2f})")
+        log(f"{tag_} no signal: close1 {close1:.2f} not above prior {tf['top_lookback']} ({prior_high:.2f})")
         return True
     if runup < tf["min_runup"]:
-        log(f"{tag} no signal: run-up {runup:.2f} below {tf['min_runup']}")
+        log(f"{tag_} no signal: run-up {runup:.2f} below {tf['min_runup']}")
         return True
     if gap > tf["tolerance"]:
-        log(f"{tag} no signal: gap {gap:.2f} above {tf['tolerance']}")
+        log(f"{tag_} no signal: gap {gap:.2f} above {tf['tolerance']}")
         return True
     if close2 < lowest_prev:
-        log(f"{tag} no signal: candle 2 close {close2:.2f} is the lowest of the last {RUNUP_WINDOW} ({lowest_prev:.2f})")
+        log(f"{tag_} no signal: candle 2 close {close2:.2f} is the lowest of the last {RUNUP_WINDOW} ({lowest_prev:.2f})")
         return True
 
     ok, why = step_filter("sell", candles[c1], candles[c2], tf["min_close_back"])
     if not ok:
-        log(f"{tag} no signal: step filter: {why}")
+        log(f"{tag_} no signal: step filter: {why}")
         return True
 
     try:
         entry, _ask = fetch_quote()          # a sell enters at the bid
     except Exception as e:
-        log(f"{tag} pattern matched but quote fetch failed: {e}")
+        log(f"{tag_} pattern matched but quote fetch failed: {e}")
         return False
     open_new_trade(tf, entry, ts)
     log_signal(key)
-    log(f"{tag} SIGNAL FIRED @ {entry:.2f} (gap {gap:.2f}, {why})")
+    log(f"{tag_} SIGNAL FIRED @ {entry:.2f} (gap {gap:.2f}, {why})")
     return True
 
 
@@ -357,13 +387,24 @@ def open_new_trade(tf, entry, signal_time):
     tp1 = entry - tf["tps"][0]
     tp2 = entry - tf["tps"][1] if len(tf["tps"]) > 1 else None
     trade_id = insert_trade(tf["name"], entry, sl, tp1, tp2, signal_time)
-    tp_line = f"TP: `{tp1:.2f}`" if tp2 is None else f"TP1: `{tp1:.2f}` | TP2: `{tp2:.2f}`"
-    send_telegram(
-        f"🟡 *GOLD {tf['label']} — SELL* (#{trade_id})\n"
-        f"Entry: `{entry:.2f}`\n"
-        f"SL: `{sl:.2f}`\n"
-        f"{tp_line}"
-    )
+
+    lines = [
+        "🔴 *SELL SIGNAL*",
+        DIVIDER,
+        f"📊 *GOLD · {tf['label']}*",
+        f"🆔 Trade #{trade_id}",
+        "",
+        f"📍 Entry: `{entry:.2f}`",
+        f"🛑 SL: `{sl:.2f}`",
+    ]
+    if tp2 is None:
+        lines.append(f"🎯 TP: `{tp1:.2f}`")
+    else:
+        lines += [f"🎯 TP1: `{tp1:.2f}`", f"🎯 TP2: `{tp2:.2f}`"]
+
+    msg_id = send_telegram("\n".join(lines))
+    if msg_id:
+        set_msg_id(trade_id, msg_id)
 
 
 # ---------------- MONITOR (silent in the log) ----------------
@@ -378,33 +419,34 @@ def monitor():
         return
 
     for t in trades:
-        name, tid = t["timeframe"], t["id"]
+        tid = t["id"]
         hit_sl = price >= t["sl"]
+        reply = t.get("msg_id")
+        res = result_line(t, price)
 
         if t["tp2"] is None:                                   # single-TP (15M)
             if hit_sl:
-                send_telegram(f"🔴 *GOLD {name} Trade #{tid} Closed — Stop Loss*\n"
-                              f"SELL entry {t['entry']:.2f} → exit {price:.2f}")
+                send_telegram(f"❌ *STOP LOSS HIT*\n{tag(t)}\n{res}", reply_to=reply)
                 close_trade(tid, "SL")
             elif price <= t["tp1"]:
-                send_telegram(f"🟢 *GOLD {name} TP Hit — Trade #{tid} Closed*\n"
-                              f"SELL entry {t['entry']:.2f} → exit {price:.2f}")
+                send_telegram(f"🏆 *TP HIT — TRADE CLOSED*\n{tag(t)}\n{res}", reply_to=reply)
                 close_trade(tid, "TP")
             continue
 
         if hit_sl:                                             # two-TP (30M, 1H)
-            outcome = "BREAKEVEN" if t["tp1_hit"] else "SL"
-            label = "Breakeven (SL moved after TP1)" if t["tp1_hit"] else "Stop Loss"
-            send_telegram(f"🔴 *GOLD {name} Trade #{tid} Closed — {label}*\n"
-                          f"SELL entry {t['entry']:.2f} → exit {price:.2f}")
-            close_trade(tid, outcome)
+            if t["tp1_hit"]:
+                send_telegram(f"➖ *BREAKEVEN — TRADE CLOSED*\n{tag(t)}\n"
+                              f"SL (moved to entry after TP1) was hit\n{res}", reply_to=reply)
+                close_trade(tid, "BREAKEVEN")
+            else:
+                send_telegram(f"❌ *STOP LOSS HIT*\n{tag(t)}\n{res}", reply_to=reply)
+                close_trade(tid, "SL")
         elif (not t["tp1_hit"]) and price <= t["tp1"]:
             tp1_hit(tid, t["entry"])
-            send_telegram(f"🟢 *GOLD {name} TP1 Hit* — Trade #{tid} entry {t['entry']:.2f} → {price:.2f}\n"
-                          f"SL moved to breakeven. Now targeting TP2 ({t['tp2']:.2f})")
+            send_telegram(f"✅ *TP1 HIT*\n{tag(t)}\n{res}\n\n"
+                          f"🔒 SL moved to breakeven\n🎯 Next: TP2 `{t['tp2']:.2f}`", reply_to=reply)
         elif t["tp1_hit"] and price <= t["tp2"]:
-            send_telegram(f"🟢🟢 *GOLD {name} TP2 Hit — Trade #{tid} Closed*\n"
-                          f"SELL entry {t['entry']:.2f} → exit {price:.2f}")
+            send_telegram(f"🏆 *TP2 HIT — TRADE CLOSED*\n{tag(t)}\n{res}", reply_to=reply)
             close_trade(tid, "TP2")
 
 
@@ -421,12 +463,13 @@ def weekly_summary():
 
     s15, s30, s1h = stats(since, "15M"), stats(since, "30M"), stats(since, "1H")
     send_telegram(
-        f"📊 *Weekly Summary*\n\n"
-        f"*GOLD 15M SCALPING*\nClosed: {s15['total']} | TP: {s15['tp']} | SL: {s15['sl']}\n\n"
-        f"*GOLD 30M SCALPING*\nClosed: {s30['total']} | TP2: {s30['tp2']} | "
-        f"Breakeven: {s30['be']} | SL: {s30['sl']}\n\n"
-        f"*GOLD 1H*\nClosed: {s1h['total']} | TP2: {s1h['tp2']} | "
-        f"Breakeven: {s1h['be']} | SL: {s1h['sl']}"
+        f"📊 *WEEKLY SUMMARY*\n{DIVIDER}\n\n"
+        f"*GOLD · 15M SCALPING*\n"
+        f"Closed: {s15['total']}  |  ✅ TP: {s15['tp']}  |  ❌ SL: {s15['sl']}\n\n"
+        f"*GOLD · 30M SCALPING*\n"
+        f"Closed: {s30['total']}  |  🏆 TP2: {s30['tp2']}  |  ➖ BE: {s30['be']}  |  ❌ SL: {s30['sl']}\n\n"
+        f"*GOLD · 1H*\n"
+        f"Closed: {s1h['total']}  |  🏆 TP2: {s1h['tp2']}  |  ➖ BE: {s1h['be']}  |  ❌ SL: {s1h['sl']}"
     )
     set_meta("last_summary_sent", now.isoformat())
 
@@ -443,13 +486,14 @@ def main():
     COMMANDS_ENABLED = bool(os.environ.get("TELEGRAM_BOT_TOKEN_EXCHANGE")) and \
         os.environ.get("TELEGRAM_BOT_TOKEN_EXCHANGE") != os.environ.get("TELEGRAM_BOT_TOKEN")
     init_db()
+    log(f"Database file: {DB_PATH}")
 
     while not pick_source():
         log("No data source reachable, retrying in 60s")
         time.sleep(60)
 
-    send_telegram(f"✅ Gold CFD bot started (1H + 30M + 15M)\nData source: Bitget CFD {SYMBOL}")
-    log("CFD bot running: scanning 15M, 30M, 1H")
+    send_telegram(f"✅ *Gold CFD bot started*\n15M · 30M · 1H · Sell only\nData: Bitget CFD {SYMBOL}")
+    log("CFD sell-only bot running: scanning 15M, 30M, 1H")
 
     last_scan = {t["name"]: None for t in TIMEFRAMES}
     last_summary = 0
