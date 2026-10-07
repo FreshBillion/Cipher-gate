@@ -29,14 +29,14 @@ DIVIDER = "━━━━━━━━━━━━"
 
 TIMEFRAMES = [
     {"name": "15M", "label": "15M SCALPING", "tf": "15m", "minutes": 15,
-     "min_runup": 15, "top_lookback": 8, "tolerance": 0.30, "min_close_back": 0.30,
-     "sl": 10, "tps": [12], "scan_window": 4, "max_age": 5},
+     "min_runup": 20, "top_lookback": 20, "tolerance": 0.10, "min_close_back": 0.70,
+     "sl": 10, "tps": [10], "scan_window": 2, "max_age": 4},
     {"name": "30M", "label": "30M SCALPING", "tf": "30m", "minutes": 30,
-     "min_runup": 20, "top_lookback": 6, "tolerance": 0.30, "min_close_back": 0.30,
-     "sl": 10, "tps": [10, 20], "scan_window": 5, "max_age": 10},
+     "min_runup": 30, "top_lookback": 10, "tolerance": 0.20, "min_close_back": 0.70,
+     "sl": 10, "tps": [10, 20], "scan_window": 3, "max_age": 6},
     {"name": "1H", "label": "1H", "tf": "1h", "minutes": 60,
-     "min_runup": 25, "top_lookback": 5, "tolerance": 0.30, "min_close_back": 0.30,
-     "sl": 10, "tps": [15, 20], "scan_window": 5, "max_age": 10},
+     "min_runup": 40, "top_lookback": 5, "tolerance": 0.30, "min_close_back": 0.70,
+     "sl": 10, "tps": [15, 25], "scan_window": 5, "max_age": 10},
 ]
 TF_BY_NAME = {t["name"]: t for t in TIMEFRAMES}
 
@@ -389,18 +389,18 @@ def open_new_trade(tf, entry, signal_time):
     trade_id = insert_trade(tf["name"], entry, sl, tp1, tp2, signal_time)
 
     lines = [
-        "🔴 *SELL SIGNAL*",
+        "♦️💲 *SELL SIGNAL*",
         DIVIDER,
         f"📊 *GOLD · {tf['label']}*",
-        f"🆔 Trade #{trade_id}",
+        f"🛡️ Trade #{trade_id}",
         "",
-        f"📍 Entry: `{entry:.2f}`",
-        f"🛑 SL: `{sl:.2f}`",
+        f"🎲 Entry: `{entry:.2f}`",
+        f"🚩 SL: `{sl:.2f}`",
     ]
     if tp2 is None:
-        lines.append(f"🎯 TP: `{tp1:.2f}`")
+        lines.append(f"🏦 TP: `{tp1:.2f}`")
     else:
-        lines += [f"🎯 TP1: `{tp1:.2f}`", f"🎯 TP2: `{tp2:.2f}`"]
+        lines += [f"⏳ TP1: `{tp1:.2f}`", f"🏛️ TP2: `{tp2:.2f}`"]
 
     msg_id = send_telegram("\n".join(lines))
     if msg_id:
@@ -429,24 +429,24 @@ def monitor():
                 send_telegram(f"❌ *STOP LOSS HIT*\n{tag(t)}\n{res}", reply_to=reply)
                 close_trade(tid, "SL")
             elif price <= t["tp1"]:
-                send_telegram(f"🏆 *TP HIT — TRADE CLOSED*\n{tag(t)}\n{res}", reply_to=reply)
+                send_telegram(f"🏦 *TP HIT — TRADE CLOSED*\n{tag(t)}\n{res}", reply_to=reply)
                 close_trade(tid, "TP")
             continue
 
         if hit_sl:                                             # two-TP (30M, 1H)
             if t["tp1_hit"]:
-                send_telegram(f"➖ *BREAKEVEN — TRADE CLOSED*\n{tag(t)}\n"
+                send_telegram(f"⚖️ *BREAKEVEN — TRADE CLOSED*\n{tag(t)}\n"
                               f"SL (moved to entry after TP1) was hit\n{res}", reply_to=reply)
                 close_trade(tid, "BREAKEVEN")
             else:
-                send_telegram(f"❌ *STOP LOSS HIT*\n{tag(t)}\n{res}", reply_to=reply)
+                send_telegram(f"🚩 *STOP LOSS HIT*\n{tag(t)}\n{res}", reply_to=reply)
                 close_trade(tid, "SL")
         elif (not t["tp1_hit"]) and price <= t["tp1"]:
             tp1_hit(tid, t["entry"])
-            send_telegram(f"✅ *TP1 HIT*\n{tag(t)}\n{res}\n\n"
-                          f"🔒 SL moved to breakeven\n🎯 Next: TP2 `{t['tp2']:.2f}`", reply_to=reply)
+            send_telegram(f"⏳ *TP1 HIT*\n{tag(t)}\n{res}\n\n"
+                          f"⚖️ SL moved to breakeven\n🏛️ Next: TP2 `{t['tp2']:.2f}`", reply_to=reply)
         elif t["tp1_hit"] and price <= t["tp2"]:
-            send_telegram(f"🏆 *TP2 HIT — TRADE CLOSED*\n{tag(t)}\n{res}", reply_to=reply)
+            send_telegram(f"🏛️🏦 *TP2 HIT — TRADE CLOSED*\n{tag(t)}\n{res}", reply_to=reply)
             close_trade(tid, "TP2")
 
 
@@ -465,11 +465,11 @@ def weekly_summary():
     send_telegram(
         f"📊 *WEEKLY SUMMARY*\n{DIVIDER}\n\n"
         f"*GOLD · 15M SCALPING*\n"
-        f"Closed: {s15['total']}  |  ✅ TP: {s15['tp']}  |  ❌ SL: {s15['sl']}\n\n"
+        f"Closed: {s15['total']}  |  🏦 TP: {s15['tp']}  |  🚩 SL: {s15['sl']}\n\n"
         f"*GOLD · 30M SCALPING*\n"
-        f"Closed: {s30['total']}  |  🏆 TP2: {s30['tp2']}  |  ➖ BE: {s30['be']}  |  ❌ SL: {s30['sl']}\n\n"
+        f"Closed: {s30['total']}  |  🏛️🏦 TP2: {s30['tp2']}  |  ⚖️ BE: {s30['be']}  |  🚩 SL: {s30['sl']}\n\n"
         f"*GOLD · 1H*\n"
-        f"Closed: {s1h['total']}  |  🏆 TP2: {s1h['tp2']}  |  ➖ BE: {s1h['be']}  |  ❌ SL: {s1h['sl']}"
+        f"Closed: {s1h['total']}  |  🏛️🏦 TP2: {s1h['tp2']}  |  ⚖️ BE: {s1h['be']}  |  🚩 SL: {s1h['sl']}"
     )
     set_meta("last_summary_sent", now.isoformat())
 
@@ -492,7 +492,7 @@ def main():
         log("No data source reachable, retrying in 60s")
         time.sleep(60)
 
-    send_telegram(f"✅ *Gold CFD bot started*\n15M · 30M · 1H · Sell only\nData: Bitget CFD {SYMBOL}")
+    send_telegram(f"✅ *Bot started* {SYMBOL}")
     log("CFD sell-only bot running: scanning 15M, 30M, 1H")
 
     last_scan = {t["name"]: None for t in TIMEFRAMES}
