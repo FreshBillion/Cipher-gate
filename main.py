@@ -1,4 +1,4 @@
-# ---- Gold CFD Bot, SELL-ONLY (Bitget CFD data): 1H + 30M + 15M ----
+ # ---- Gold CFD Bot, SELL-ONLY (Bitget CFD data): 1H + 30M + 15M ----
 # Env vars:
 #   BITGET_API_KEY, BITGET_API_SECRET, BITGET_API_PASSPHRASE   (READ-ONLY key)
 #   CFD_SYMBOL                    (optional: XAUUSD, XAUUSD.s or XAUUSD.pro)
