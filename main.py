@@ -1,4 +1,9 @@
- # ---- Gold CFD Bot, SELL-ONLY (Bitget CFD data): 1H + 30M + 15M ----
+# ---- Gold CFD Bot, SELL-ONLY (Bitget CFD data): 1H + 30M + 15M ----
+# Two paper streams per timeframe:
+#   BASELINE = your original rules, takes every signal. SILENT (weekly summary only).
+#   MAIN     = original rules + STEP RULE + STOP-LOSS BLOCK. Only MAIN sends Telegram messages.
+# Same entry / SL / TP for both streams. One trade at a time per stream per timeframe.
+#
 # Env vars:
 #   BITGET_API_KEY, BITGET_API_SECRET, BITGET_API_PASSPHRASE   (READ-ONLY key)
 #   CFD_SYMBOL                    (optional: XAUUSD, XAUUSD.s or XAUUSD.pro)
@@ -16,6 +21,14 @@ import sqlite3
 import requests
 from urllib.parse import urlencode
 from datetime import datetime, timedelta, timezone
+
+# ================= NEW RULE SETTINGS =================
+STEP_WINDOW = 5                                        # step rule: look at this many candles right before c1
+BLOCK_LIFT_CANDLES = {"15M": 2, "30M": 1, "1H": 1}     # straight falling candles after a stop-loss that lift the block
+RESET_GAP = 0.10                                       # reset pair: c2 open must be within this of c1 close
+RESET_CLOSE_BACK = 0.30                                # reset pair: c2 must close at least this far below c1 close
+EPS = 1e-9                                             # float safety for the two values above
+# =====================================================
 
 BASE_URL = "https://api.bitget.com"
 SYMBOL_CANDIDATES = ["XAUUSD", "XAUUSD.s", "XAUUSD.pro"]
@@ -70,11 +83,12 @@ def init_db():
             timeframe TEXT, entry REAL, sl REAL, tp1 REAL, tp2 REAL,
             tp1_hit INTEGER DEFAULT 0, status TEXT DEFAULT 'open',
             outcome TEXT, signal_time TEXT, opened_at TEXT, closed_at TEXT,
-            msg_id INTEGER)""")
-    try:
-        db("ALTER TABLE trades ADD COLUMN msg_id INTEGER")    # upgrade an older database
-    except sqlite3.OperationalError:
-        pass                                                   # column already exists
+            msg_id INTEGER, variant TEXT DEFAULT 'BASELINE')""")
+    for col in ("msg_id INTEGER", "variant TEXT DEFAULT 'BASELINE'"):   # upgrade an older database
+        try:
+            db(f"ALTER TABLE trades ADD COLUMN {col}")
+        except sqlite3.OperationalError:
+            pass                                                         # column already exists
     db("CREATE TABLE IF NOT EXISTS signal_log (signal_key TEXT PRIMARY KEY)")
     db("CREATE TABLE IF NOT EXISTS bot_meta (key TEXT PRIMARY KEY, value TEXT)")
 
@@ -85,7 +99,11 @@ def get_meta(key):
 
 
 def set_meta(key, value):
-    db("INSERT OR REPLACE INTO bot_meta (key, value) VALUES (?, ?)", (key, value))
+    db("INSERT OR REPLACE INTO bot_meta (key, value) VALUES (?, ?)", (key, str(value)))
+
+
+def bump(key):
+    set_meta(key, int(get_meta(key) or 0) + 1)
 
 
 def signaled(key):
@@ -96,20 +114,25 @@ def log_signal(key):
     db("INSERT OR IGNORE INTO signal_log (signal_key) VALUES (?)", (key,))
 
 
-def insert_trade(tf, entry, sl, tp1, tp2, signal_time):
-    return db("""INSERT INTO trades (timeframe, entry, sl, tp1, tp2, signal_time, opened_at)
-                 VALUES (?, ?, ?, ?, ?, ?, ?)""",
-              (tf, entry, sl, tp1, tp2, str(signal_time), datetime.now(timezone.utc).isoformat()))
+def insert_trade(variant, tf, entry, sl, tp1, tp2, signal_time):
+    return db("""INSERT INTO trades (variant, timeframe, entry, sl, tp1, tp2, signal_time, opened_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+              (variant, tf, entry, sl, tp1, tp2, str(signal_time), datetime.now(timezone.utc).isoformat()))
 
 
 def set_msg_id(trade_id, msg_id):
     db("UPDATE trades SET msg_id=? WHERE id=?", (msg_id, trade_id))
 
 
-def open_trades(tf=None):
+def open_trades(tf=None, variant=None):
+    sql, params = "SELECT * FROM trades WHERE status='open'", []
     if tf:
-        return db("SELECT * FROM trades WHERE status='open' AND timeframe=?", (tf,), fetch=True)
-    return db("SELECT * FROM trades WHERE status='open'", fetch=True)
+        sql += " AND timeframe=?"
+        params.append(tf)
+    if variant:
+        sql += " AND variant=?"
+        params.append(variant)
+    return db(sql, tuple(params), fetch=True)
 
 
 def close_trade(trade_id, outcome):
@@ -121,12 +144,32 @@ def tp1_hit(trade_id, new_sl):
     db("UPDATE trades SET tp1_hit=1, sl=? WHERE id=?", (new_sl, trade_id))
 
 
-def stats(since, tf):
-    rows = db("SELECT outcome FROM trades WHERE timeframe=? AND closed_at>=?",
-              (tf, since.isoformat()), fetch=True)
+def stats(since, tf, variant):
+    rows = db("SELECT outcome FROM trades WHERE timeframe=? AND variant=? AND closed_at>=?",
+              (tf, variant, since.isoformat()), fetch=True)
     o = [r["outcome"] for r in rows]
     return {"total": len(o), "tp": o.count("TP"), "tp2": o.count("TP2"),
             "be": o.count("BREAKEVEN"), "sl": o.count("SL")}
+
+
+# ---------------- STOP-LOSS BLOCK STATE (saved in the database) ----------------
+def blk_key(name, field):
+    return f"blk_sell_{field}_{name}"
+
+
+def blk_get(name):
+    """Returns (blocked, count, since_ms, last_counted_candle_open_ms)."""
+    return (get_meta(blk_key(name, "on")) == "1",
+            int(get_meta(blk_key(name, "count")) or 0),
+            int(get_meta(blk_key(name, "since")) or 0),
+            int(get_meta(blk_key(name, "last")) or 0))
+
+
+def blk_set(name, on, count, since, last):
+    set_meta(blk_key(name, "on"), "1" if on else "0")
+    set_meta(blk_key(name, "count"), count)
+    set_meta(blk_key(name, "since"), since)
+    set_meta(blk_key(name, "last"), last)
 
 
 # ---------------- TELEGRAM ----------------
@@ -143,6 +186,12 @@ def send_telegram(message, reply_to=None):
     except Exception as e:
         log(f"[Telegram error] {e}")
         return None
+
+
+def notify(t, message):
+    """Only MAIN trades send Telegram messages. BASELINE trades stay silent."""
+    if t.get("variant") == "MAIN":
+        send_telegram(message, reply_to=t.get("msg_id"))
 
 
 def money(x):
@@ -193,7 +242,7 @@ def check_commands():
             send_telegram(f"Trade #{tid} not found or already closed.")
             continue
         close_trade(tid, "MANUAL_CLOSE")
-        send_telegram(f"⚪ *MANUALLY CLOSED*\n{tag(rows[0])}", reply_to=rows[0].get("msg_id"))
+        notify(rows[0], f"⚪ *MANUALLY CLOSED*\n{tag(rows[0])}")
 
 
 # ---------------- BITGET CFD DATA ----------------
@@ -296,7 +345,7 @@ def pick_source():
 
 # ---------------- STRATEGY (sell-only) ----------------
 def step_filter(direction, candle1, candle2, min_close_back):
-    """Returns (ok, reason). Candles are [ts, open, high, low, close]."""
+    """ORIGINAL rule 6 check (unchanged). Returns (ok, reason). Candles are [ts, open, high, low, close]."""
     open1, close1 = candle1[1], candle1[4]
     close2 = candle2[4]
     if direction == "sell":
@@ -312,13 +361,97 @@ def step_filter(direction, candle1, candle2, min_close_back):
     return True, f"step ok, back {back:.2f}"
 
 
+def evaluate(tf, candles):
+    """Your ORIGINAL sell rules (unchanged logic). candles = closed candles, last one is c2.
+    Returns (fired, reason)."""
+    closes = [c[4] for c in candles]
+    c1, c2 = len(candles) - 2, len(candles) - 1
+    close1, open2, close2 = candles[c1][4], candles[c2][1], candles[c2][4]
+    prior_high = max(closes[c1 - tf["top_lookback"]:c1])
+    runup = close1 - min(closes[c1 - RUNUP_WINDOW:c1])
+    gap = abs(close1 - open2)
+    lowest_prev = min(closes[c2 - RUNUP_WINDOW:c2])
+
+    if close1 <= prior_high:
+        return False, f"close1 {close1:.2f} not above prior {tf['top_lookback']} ({prior_high:.2f})"
+    if runup < tf["min_runup"]:
+        return False, f"run-up {runup:.2f} below {tf['min_runup']}"
+    if gap > tf["tolerance"]:
+        return False, f"gap {gap:.2f} above {tf['tolerance']}"
+    if close2 < lowest_prev:
+        return False, f"candle 2 close {close2:.2f} is the lowest of the last {RUNUP_WINDOW} ({lowest_prev:.2f})"
+    ok, why = step_filter("sell", candles[c1], candles[c2], tf["min_close_back"])
+    if not ok:
+        return False, f"step filter: {why}"
+    return True, f"gap {gap:.2f}, {why}"
+
+
+# ---------------- NEW RULE 1: STEP RULE ----------------
+def step_rule_ok(candles):
+    """Among the STEP_WINDOW candles right before c1 there must be two NEIGHBOURING bullish candles
+    where the second closes higher than the first (anywhere inside the window)."""
+    c1 = len(candles) - 2
+    pre = candles[max(0, c1 - STEP_WINDOW):c1]
+    for a, b in zip(pre, pre[1:]):
+        if a[4] > a[1] and b[4] > b[1] and b[4] > a[4]:
+            return True
+    return False
+
+
+# ---------------- NEW RULE 2: STOP-LOSS BLOCK ----------------
+def reset_pair(tf, candles):
+    """Last two candles look like a sell signal pair: c1 bullish, c2 opens within RESET_GAP of c1's
+    close and closes at least RESET_CLOSE_BACK below it. Nothing else is checked."""
+    if len(candles) < 2:
+        return False
+    c1, c2 = candles[-2], candles[-1]
+    if c2[0] - c1[0] != tf["minutes"] * 60000:
+        return False
+    if abs(c1[4] - c2[1]) > RESET_GAP + EPS:
+        return False
+    return c1[4] > c1[1] and (c1[4] - c2[4]) >= RESET_CLOSE_BACK - EPS
+
+
+def start_block(name):
+    """Called when a MAIN trade hits its stop-loss (a real SL, not breakeven)."""
+    blk_set(name, True, 0, int(time.time() * 1000), 0)
+    log(f"{name} sell block started (needs {BLOCK_LIFT_CANDLES[name]} straight falling candles)")
+
+
+def update_block(tf, candles):
+    """Runs once per closed candle (candles[-1] = the candle that just closed).
+    Returns True if the sell block is still on after this candle."""
+    name, tf_ms = tf["name"], tf["minutes"] * 60000
+    on, count, since, last = blk_get(name)
+    if not on:
+        return False
+    open_ts = candles[-1][0]
+    if last == open_ts or open_ts + tf_ms <= since:     # already counted, or closed before the stop-loss
+        return True
+
+    if (open_ts - last > tf_ms) if last else (open_ts > since):
+        count, why = 0, "candle missed"                 # the candle does not count
+    elif reset_pair(tf, candles):
+        count, why = 0, "reset pair"                    # the triggering candle does not count
+    elif candles[-1][4] < candles[-1][1]:
+        count, why = count + 1, "falling"
+    else:
+        count, why = 0, "not falling"
+
+    need = BLOCK_LIFT_CANDLES[name]
+    if count >= need:
+        blk_set(name, False, 0, 0, 0)
+        log(f"{name} sell block lifted after {need} straight falling candle(s)")
+        return False
+    blk_set(name, True, count, since, open_ts)
+    log(f"{name} sell block: {count}/{need} ({why})")
+    return True
+
+
+# ---------------- SCAN ----------------
 def scan(tf):
     """True = scan finished (signal or not). False = data problem, retry inside the window."""
     name = tf["name"]
-    if open_trades(name):
-        log(f"{name} scan skipped: trade open")
-        return True
-
     try:
         candles = fetch_candles(tf)
     except Exception as e:
@@ -329,7 +462,6 @@ def scan(tf):
         return False
 
     tf_ms = tf["minutes"] * 60000
-    closes = [c[4] for c in candles]
     c1, c2 = len(candles) - 2, len(candles) - 1
     ts = candles[c2][0]
     when = datetime.fromtimestamp(ts / 1000, timezone.utc).strftime("%m-%d %H:%M")
@@ -339,54 +471,61 @@ def scan(tf):
     if age > tf["max_age"]:
         log(f"{tag_} skipped: candle closed {age:.0f} min ago, too old")
         return True
-    key = f"{name}-{ts}"
-    if signaled(key):
-        log(f"{tag_} skipped: already signaled")
+
+    blocked = update_block(tf, candles)                 # count this candle toward the block (MAIN only uses it)
+
+    bkey, mkey = f"{name}-{ts}", f"M-{name}-{ts}"
+    base_todo = not open_trades(name, "BASELINE") and not signaled(bkey)
+    main_todo = not open_trades(name, "MAIN") and not signaled(mkey)
+    if not (base_todo or main_todo):
+        log(f"{tag_} scan skipped: trades open or already signaled")
         return True
     if candles[c2][0] - candles[c1][0] != tf_ms:
         log(f"{tag_} skipped: candles 1 and 2 are not consecutive (market break)")
         return True
 
-    close1, open2, close2 = candles[c1][4], candles[c2][1], candles[c2][4]
-    prior_high = max(closes[c1 - tf["top_lookback"]:c1])
-    runup = close1 - min(closes[c1 - RUNUP_WINDOW:c1])
-    gap = abs(close1 - open2)
-    lowest_prev = min(closes[c2 - RUNUP_WINDOW:c2])
-
-    if close1 <= prior_high:
-        log(f"{tag_} no signal: close1 {close1:.2f} not above prior {tf['top_lookback']} ({prior_high:.2f})")
-        return True
-    if runup < tf["min_runup"]:
-        log(f"{tag_} no signal: run-up {runup:.2f} below {tf['min_runup']}")
-        return True
-    if gap > tf["tolerance"]:
-        log(f"{tag_} no signal: gap {gap:.2f} above {tf['tolerance']}")
-        return True
-    if close2 < lowest_prev:
-        log(f"{tag_} no signal: candle 2 close {close2:.2f} is the lowest of the last {RUNUP_WINDOW} ({lowest_prev:.2f})")
+    fired, why = evaluate(tf, candles)
+    if not fired:
+        log(f"{tag_} no signal: {why}")
         return True
 
-    ok, why = step_filter("sell", candles[c1], candles[c2], tf["min_close_back"])
-    if not ok:
-        log(f"{tag_} no signal: step filter: {why}")
+    plan = []
+    if base_todo:
+        plan.append("BASELINE")
+    if main_todo:
+        reason = None
+        if blocked:
+            reason = "block"
+        elif not step_rule_ok(candles):
+            reason = "step"
+        else:
+            plan.append("MAIN")
+        if reason:                                      # count each skipped signal once
+            log_signal(mkey)
+            bump(f"skip_{name}_{reason}")
+            log(f"{tag_} MAIN signal skipped by the {reason} rule")
+    if not plan:
         return True
 
     try:
-        entry, _ask = fetch_quote()          # a sell enters at the bid
+        entry, _ask = fetch_quote()                     # a sell enters at the bid
     except Exception as e:
         log(f"{tag_} pattern matched but quote fetch failed: {e}")
         return False
-    open_new_trade(tf, entry, ts)
-    log_signal(key)
-    log(f"{tag_} SIGNAL FIRED @ {entry:.2f} (gap {gap:.2f}, {why})")
+    for variant in plan:
+        open_new_trade(tf, entry, ts, variant)
+        log_signal(bkey if variant == "BASELINE" else mkey)
+        log(f"{tag_} {variant} SIGNAL FIRED @ {entry:.2f} ({why})")
     return True
 
 
-def open_new_trade(tf, entry, signal_time):
+def open_new_trade(tf, entry, signal_time, variant):
     sl = entry + tf["sl"]
     tp1 = entry - tf["tps"][0]
     tp2 = entry - tf["tps"][1] if len(tf["tps"]) > 1 else None
-    trade_id = insert_trade(tf["name"], entry, sl, tp1, tp2, signal_time)
+    trade_id = insert_trade(variant, tf["name"], entry, sl, tp1, tp2, signal_time)
+    if variant != "MAIN":
+        return trade_id                                 # BASELINE is silent
 
     lines = [
         "♦️💲 *SELL SIGNAL*",
@@ -405,9 +544,15 @@ def open_new_trade(tf, entry, signal_time):
     msg_id = send_telegram("\n".join(lines))
     if msg_id:
         set_msg_id(trade_id, msg_id)
+    return trade_id
 
 
 # ---------------- MONITOR (silent in the log) ----------------
+def on_stop_loss(t):
+    if t.get("variant") == "MAIN":                      # only a real SL from the MAIN stream starts a block
+        start_block(t["timeframe"])
+
+
 def monitor():
     trades = open_trades()
     if not trades:
@@ -421,36 +566,43 @@ def monitor():
     for t in trades:
         tid = t["id"]
         hit_sl = price >= t["sl"]
-        reply = t.get("msg_id")
         res = result_line(t, price)
 
         if t["tp2"] is None:                                   # single-TP (15M)
             if hit_sl:
-                send_telegram(f"❌ *STOP LOSS HIT*\n{tag(t)}\n{res}", reply_to=reply)
+                notify(t, f"❌ *STOP LOSS HIT*\n{tag(t)}\n{res}")
                 close_trade(tid, "SL")
+                on_stop_loss(t)
             elif price <= t["tp1"]:
-                send_telegram(f"🏦 *TP HIT — TRADE CLOSED*\n{tag(t)}\n{res}", reply_to=reply)
+                notify(t, f"🏦 *TP HIT — TRADE CLOSED*\n{tag(t)}\n{res}")
                 close_trade(tid, "TP")
             continue
 
         if hit_sl:                                             # two-TP (30M, 1H)
             if t["tp1_hit"]:
-                send_telegram(f"⚖️ *BREAKEVEN — TRADE CLOSED*\n{tag(t)}\n"
-                              f"SL (moved to entry after TP1) was hit\n{res}", reply_to=reply)
-                close_trade(tid, "BREAKEVEN")
+                notify(t, f"⚖️ *BREAKEVEN — TRADE CLOSED*\n{tag(t)}\n"
+                          f"SL (moved to entry after TP1) was hit\n{res}")
+                close_trade(tid, "BREAKEVEN")                  # breakeven does NOT start a block
             else:
-                send_telegram(f"🚩 *STOP LOSS HIT*\n{tag(t)}\n{res}", reply_to=reply)
+                notify(t, f"🚩 *STOP LOSS HIT*\n{tag(t)}\n{res}")
                 close_trade(tid, "SL")
+                on_stop_loss(t)
         elif (not t["tp1_hit"]) and price <= t["tp1"]:
             tp1_hit(tid, t["entry"])
-            send_telegram(f"⏳ *TP1 HIT*\n{tag(t)}\n{res}\n\n"
-                          f"⚖️ SL moved to breakeven\n🏛️ Next: TP2 `{t['tp2']:.2f}`", reply_to=reply)
+            notify(t, f"⏳ *TP1 HIT*\n{tag(t)}\n{res}\n\n"
+                      f"⚖️ SL moved to breakeven\n🏛️ Next: TP2 `{t['tp2']:.2f}`")
         elif t["tp1_hit"] and price <= t["tp2"]:
-            send_telegram(f"🏛️🏦 *TP2 HIT — TRADE CLOSED*\n{tag(t)}\n{res}", reply_to=reply)
+            notify(t, f"🏛️🏦 *TP2 HIT — TRADE CLOSED*\n{tag(t)}\n{res}")
             close_trade(tid, "TP2")
 
 
 # ---------------- WEEKLY SUMMARY ----------------
+def stat_line(name, s):
+    if name == "15M":
+        return f"Closed: {s['total']}  |  🏦 TP: {s['tp']}  |  🚩 SL: {s['sl']}"
+    return f"Closed: {s['total']}  |  🏛️🏦 TP2: {s['tp2']}  |  ⚖️ BE: {s['be']}  |  🚩 SL: {s['sl']}"
+
+
 def weekly_summary():
     now = datetime.now(timezone.utc)
     last = get_meta("last_summary_sent")
@@ -461,16 +613,17 @@ def weekly_summary():
     if now - since < timedelta(days=7):
         return
 
-    s15, s30, s1h = stats(since, "15M"), stats(since, "30M"), stats(since, "1H")
-    send_telegram(
-        f"📊 *WEEKLY SUMMARY*\n{DIVIDER}\n\n"
-        f"*GOLD · 15M SCALPING*\n"
-        f"Closed: {s15['total']}  |  🏦 TP: {s15['tp']}  |  🚩 SL: {s15['sl']}\n\n"
-        f"*GOLD · 30M SCALPING*\n"
-        f"Closed: {s30['total']}  |  🏛️🏦 TP2: {s30['tp2']}  |  ⚖️ BE: {s30['be']}  |  🚩 SL: {s30['sl']}\n\n"
-        f"*GOLD · 1H*\n"
-        f"Closed: {s1h['total']}  |  🏛️🏦 TP2: {s1h['tp2']}  |  ⚖️ BE: {s1h['be']}  |  🚩 SL: {s1h['sl']}"
-    )
+    parts = [f"📊 *WEEKLY SUMMARY*\n{DIVIDER}"]
+    for tf in TIMEFRAMES:
+        n = tf["name"]
+        parts.append(
+            f"\n*GOLD · {tf['label']}*\n"
+            f"New rules: {stat_line(n, stats(since, n, 'MAIN'))}\n"
+            f"Baseline: {stat_line(n, stats(since, n, 'BASELINE'))}\n"
+            f"Skipped: block {get_meta(f'skip_{n}_block') or 0}  |  step rule {get_meta(f'skip_{n}_step') or 0}")
+        set_meta(f"skip_{n}_block", 0)
+        set_meta(f"skip_{n}_step", 0)
+    send_telegram("\n".join(parts))
     set_meta("last_summary_sent", now.isoformat())
 
 
@@ -493,7 +646,7 @@ def main():
         time.sleep(60)
 
     send_telegram(f"✅ *Bot started* {SYMBOL}")
-    log("CFD sell-only bot running: scanning 15M, 30M, 1H")
+    log("CFD sell-only bot running: scanning 15M, 30M, 1H (BASELINE + MAIN streams)")
 
     last_scan = {t["name"]: None for t in TIMEFRAMES}
     last_summary = 0
